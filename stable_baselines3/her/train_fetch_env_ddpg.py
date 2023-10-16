@@ -17,13 +17,13 @@ class TensorboardCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         if self.n_calls % 10000 == 0:
-            self.model.save(self.log_dir + f"/model_saved/DDPG/fetch_pick_place_{self.n_calls}")
+            self.model.save(self.log_dir + f"/model_saved/DDPG/fetch_push_{self.n_calls}")
         return True
 
 
 log_dir = "log/"
 
-env = gym.make('FetchPickAndPlace-v2', render_mode=None)
+env = gym.make('FetchPush-v2', render_mode=None)
 
 # The noise objects for DDPG
 n_actions = env.action_space.shape[-1]
@@ -43,8 +43,8 @@ model = DDPG(
     action_noise=action_noise,
     batch_size=256,
     gamma=0.98,
-    tau=0.005,
-    policy_kwargs=dict(n_critics=1, net_arch=[256]),
+    tau=0.05,
+    # policy_kwargs=dict(n_critics=1, net_arch=[256]),
 )
 
 # Train the model

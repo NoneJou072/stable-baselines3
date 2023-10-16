@@ -120,8 +120,6 @@ class DDPG(TD3):
         if _init_setup_model:
             self._setup_model()
 
-        self.is_sges = False
-
     def learn(
         self: SelfDDPG,
         total_timesteps: int,
@@ -161,8 +159,8 @@ class DDPG(TD3):
                 gradient_steps = self.gradient_steps if self.gradient_steps >= 0 else rollout.episode_timesteps
                 # Special case when the user passes `gradient_steps=0`
                 if gradient_steps > 0:
-                    self.train(batch_size=self.batch_size, gradient_steps=gradient_steps, rekey='g')
                     self.train(batch_size=self.batch_size, gradient_steps=gradient_steps, rekey='ag')
+                    self.train(batch_size=self.batch_size, gradient_steps=gradient_steps, rekey='g')
 
         callback.on_training_end()
 
@@ -200,6 +198,12 @@ class DDPG(TD3):
             self._n_updates += 1
             # Sample replay buffer
             replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env, rekey=rekey)  # type: ignore[union-attr]
+            if rekey == 'g':
+                replay_data.observations['achieved_goal'] *= 0
+                replay_data.next_observations['achieved_goal'] *= 0
+            else:
+                replay_data.observations['desired_goal'] *= 0
+                replay_data.next_observations['desired_goal'] *= 0
 
             with th.no_grad():
                 # Select action according to policy and add clipped noise
@@ -253,7 +257,7 @@ class DDPG(TD3):
             learning_starts: int,
             action_noise: Optional[ActionNoise] = None,
             n_envs: int = 1,
-    ) -> Tuple[np.ndarray, np.ndarray, bool]:
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Sample an action according to the exploration policy.
         This is either done by sampling the probability distribution of the policy,
@@ -278,22 +282,22 @@ class DDPG(TD3):
         rd = 0.2  # 随机策略选择概率。表示在 reach 阶段， 有 20% 的概率采用随机策略
         rr = 0.4 / (1.0 - rd)  # 0.4 is 自引导率。表示在 reach 阶段，有 40% 的概率采用 reach 模式。
 
-        reached = self.check_reached(self._last_obs['observation'][:, :3], self._last_obs['achieved_goal'])
+        last_obs = deepcopy(self._last_obs)
+        reached = self.check_reached(last_obs['observation'][:, :3], last_obs['achieved_goal'])
         """
             |        |stage1 |stage2 |
             |train:  |p1+p2  |p2     |
             |test:   |p2     |p2     |
         """
         # 在 reach 阶段，有 40%的概率采用 reach 策略。
-        # if np.random.random() < rr and not reached:
-        if self.is_sges and not reached:
+        if np.random.random() < rr and not reached:
             reach_a = True  # reach 模式标志位
-            self._last_obs['desired_goal'] *= 0  # Trick：零填充(zero-padding)编码, 用于区分任务
+            last_obs['desired_goal'] *= 0  # Trick：零填充(zero-padding)编码, 用于区分任务
         # 在 reach 阶段，有 60%的概率采用随机策略。
         # 在 push 阶段，有 100%的概率采用随机策略。
         else:
             reach_a = False
-            self._last_obs['achieved_goal'] *= 0
+            last_obs['achieved_goal'] *= 0
 
         # Select action randomly or according to policy
         if self.num_timesteps < learning_starts and not (self.use_sde and self.use_sde_at_warmup):
@@ -303,7 +307,7 @@ class DDPG(TD3):
             # Note: when using continuous actions,
             # we assume that the policy uses tanh to scale the action
             # We use non-deterministic action in the case of SAC, for TD3, it does not matter
-            unscaled_action, _ = self.predict(self._last_obs, deterministic=False)
+            unscaled_action, _ = self.predict(last_obs, deterministic=False)
 
         # Rescale the action from [low, high] to [-1, 1]
         if isinstance(self.action_space, spaces.Box):
@@ -325,174 +329,4 @@ class DDPG(TD3):
             buffer_action = unscaled_action
             action = buffer_action
 
-        return action, buffer_action, reach_a
-
-    def collect_rollouts(
-        self,
-        env: VecEnv,
-        callback: BaseCallback,
-        train_freq: TrainFreq,
-        replay_buffer: ReplayBuffer,
-        action_noise: Optional[ActionNoise] = None,
-        learning_starts: int = 0,
-        log_interval: Optional[int] = None,
-    ) -> RolloutReturn:
-        """
-        Collect experiences and store them into a ``ReplayBuffer``.
-
-        :param env: The training environment
-        :param callback: Callback that will be called at each step
-            (and at the beginning and end of the rollout)
-        :param train_freq: How much experience to collect
-            by doing rollouts of current policy.
-            Either ``TrainFreq(<n>, TrainFrequencyUnit.STEP)``
-            or ``TrainFreq(<n>, TrainFrequencyUnit.EPISODE)``
-            with ``<n>`` being an integer greater than 0.
-        :param action_noise: Action noise that will be used for exploration
-            Required for deterministic policy (e.g. TD3). This can also be used
-            in addition to the stochastic policy for SAC.
-        :param learning_starts: Number of steps before learning for the warm-up phase.
-        :param replay_buffer:
-        :param log_interval: Log data every ``log_interval`` episodes
-        :return:
-        """
-        # Switch to eval mode (this affects batch norm / dropout)
-        self.policy.set_training_mode(False)
-
-        num_collected_steps, num_collected_episodes = 0, 0
-
-        assert isinstance(env, VecEnv), "You must pass a VecEnv"
-        assert train_freq.frequency > 0, "Should at least collect one step or episode."
-
-        if env.num_envs > 1:
-            assert train_freq.unit == TrainFrequencyUnit.STEP, "You must use only one env when doing episodic training."
-
-        if self.use_sde:
-            self.actor.reset_noise(env.num_envs)
-
-        callback.on_rollout_start()
-        continue_training = True
-        while should_collect_more_steps(train_freq, num_collected_steps, num_collected_episodes):
-            if self.use_sde and self.sde_sample_freq > 0 and num_collected_steps % self.sde_sample_freq == 0:
-                # Sample a new noise matrix
-                self.actor.reset_noise(env.num_envs)
-
-            # Select action randomly or according to policy
-            actions, buffer_actions, reach_a = self._sample_action(learning_starts, action_noise, env.num_envs)
-
-            # Rescale and perform action
-            new_obs, rewards, dones, infos = env.step(actions)
-
-            rd = 0.2  # 随机策略选择概率。表示在 reach 阶段， 有 20% 的概率采用随机策略
-            rr = 0.4 / (1.0 - rd)  # 0.4 is 自引导率。表示在 reach 阶段，有 40% 的概率采用 reach 模式。
-            self.is_sges = np.random.random() < rr
-            reached = self.check_reached(self._last_obs['observation'][:, :3], self._last_obs['achieved_goal'])
-            if self.is_sges and not reached:
-                new_obs['desired_goal'] *= 0
-            else:
-                new_obs['achieved_goal'] *= 0
-
-            self.num_timesteps += env.num_envs
-            num_collected_steps += 1
-
-            # Give access to local variables
-            callback.update_locals(locals())
-            # Only stop training if return value is False, not when it is None.
-            if callback.on_step() is False:
-                return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training=False)
-
-            # Retrieve reward and episode length if using Monitor wrapper
-            self._update_info_buffer(infos, dones)
-
-            # Store data in replay buffer (normalized action and unnormalized observation)
-            self._store_transition(replay_buffer, buffer_actions, new_obs, rewards, dones, infos)
-
-            self._update_current_progress_remaining(self.num_timesteps, self._total_timesteps)
-
-            # For DQN, check if the target network should be updated
-            # and update the exploration schedule
-            # For SAC/TD3, the update is dones as the same time as the gradient update
-            # see https://github.com/hill-a/stable-baselines/issues/900
-            self._on_step()
-
-            for idx, done in enumerate(dones):
-                if done:
-                    # Update stats
-                    num_collected_episodes += 1
-                    self._episode_num += 1
-
-                    if action_noise is not None:
-                        kwargs = dict(indices=[idx]) if env.num_envs > 1 else {}
-                        action_noise.reset(**kwargs)
-
-                    # Log training infos
-                    if log_interval is not None and self._episode_num % log_interval == 0:
-                        self._dump_logs()
-        callback.on_rollout_end()
-
-        return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training)
-
-    def _store_transition(
-        self,
-        replay_buffer: ReplayBuffer,
-        buffer_action: np.ndarray,
-        new_obs: Union[np.ndarray, Dict[str, np.ndarray]],
-        reward: np.ndarray,
-        dones: np.ndarray,
-        infos: List[Dict[str, Any]],
-    ) -> None:
-        """
-        Store transition in the replay buffer.
-        We store the normalized action and the unnormalized observation.
-        It also handles terminal observations (because VecEnv resets automatically).
-
-        :param replay_buffer: Replay buffer object where to store the transition.
-        :param buffer_action: normalized action
-        :param new_obs: next observation in the current episode
-            or first observation of the episode (when dones is True)
-        :param reward: reward for the current transition
-        :param dones: Termination signal
-        :param infos: List of additional information about the transition.
-            It may contain the terminal observations and information about timeout.
-        """
-        # Store only the unnormalized version
-        if self._vec_normalize_env is not None:
-            new_obs_ = self._vec_normalize_env.get_original_obs()
-            reward_ = self._vec_normalize_env.get_original_reward()
-        else:
-            # Avoid changing the original ones
-            self._last_original_obs, new_obs_, reward_ = self._last_obs, new_obs, reward
-
-        # Avoid modification by reference
-        next_obs = deepcopy(new_obs_)
-        # As the VecEnv resets automatically, new_obs is already the
-        # first observation of the next episode
-        for i, done in enumerate(dones):
-            if done and infos[i].get("terminal_observation") is not None:
-                if isinstance(next_obs, dict):
-                    next_obs_ = infos[i]["terminal_observation"]
-                    # VecNormalize normalizes the terminal observation
-                    if self._vec_normalize_env is not None:
-                        next_obs_ = self._vec_normalize_env.unnormalize_obs(next_obs_)
-                    # Replace next obs for the correct envs
-                    for key in next_obs.keys():
-                        next_obs[key][i] = next_obs_[key]
-                else:
-                    next_obs[i] = infos[i]["terminal_observation"]
-                    # VecNormalize normalizes the terminal observation
-                    if self._vec_normalize_env is not None:
-                        next_obs[i] = self._vec_normalize_env.unnormalize_obs(next_obs[i, :])
-
-        replay_buffer.add(
-            self._last_original_obs,
-            next_obs,
-            buffer_action,
-            reward_,
-            dones,
-            infos,
-        )
-
-        self._last_obs = new_obs
-        # Save the unnormalized observation
-        if self._vec_normalize_env is not None:
-            self._last_original_obs = new_obs_
+        return action, buffer_action

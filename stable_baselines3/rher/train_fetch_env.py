@@ -42,7 +42,7 @@ model = DDPG_RHER(
     gamma=0.98,
     tau=0.05,
     learning_starts=100,
-    policy_kwargs=dict(n_critics=1, net_arch=[256]),
+    # policy_kwargs=dict(n_critics=1, net_arch=[256]),
 )
 
 # Train the model

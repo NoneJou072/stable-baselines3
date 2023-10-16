@@ -109,7 +109,7 @@ class RHerReplayBuffer(HerReplayBuffer):
         virtual_env_indices, real_env_indices = np.split(env_indices, [nb_virtual])
 
         # Get real and virtual data
-        real_data = self._get_real_samples(real_batch_indices, real_env_indices, env)
+        real_data = self._get_real_samples(real_batch_indices, real_env_indices, env, rekey)
         # Create virtual transitions by sampling new desired goals and computing new rewards
         virtual_data = self._get_virtual_samples(virtual_batch_indices, virtual_env_indices, env, rekey)
 
@@ -139,6 +139,7 @@ class RHerReplayBuffer(HerReplayBuffer):
             batch_indices: np.ndarray,
             env_indices: np.ndarray,
             env: Optional[VecNormalize] = None,
+            rekey: str = 'g'
     ) -> DictReplayBufferSamples:
         """
         Get the samples corresponding to the batch and environment indices.
@@ -201,26 +202,43 @@ class RHerReplayBuffer(HerReplayBuffer):
         if rekey == 'g':
             obs["desired_goal"] = new_goals
             next_obs["desired_goal"] = new_goals
+
+            # Compute new reward
+            rewards = self.env.env_method(
+                "compute_reward",
+                # the new state depends on the previous state and action
+                # s_{t+1} = f(s_t, a_t)
+                # so the next achieved_goal depends also on the previous state and action
+                # because we are in a GoalEnv:
+                # r_t = reward(s_t, a_t) = reward(next_achieved_goal, desired_goal)
+                # therefore we have to use next_obs["achieved_goal"] and not obs["achieved_goal"]
+                next_obs["achieved_goal"],
+                # here we use the new desired goal
+                obs["desired_goal"],
+                infos,
+                # we use the method of the first environment assuming that all environments are identical.
+                indices=[0],
+            )
         elif rekey == 'ag':  # reach
             obs["achieved_goal"] = new_goals
             next_obs["achieved_goal"] = new_goals
 
-        # Compute new reward
-        rewards = self.env.env_method(
-            "compute_reward",
-            # the new state depends on the previous state and action
-            # s_{t+1} = f(s_t, a_t)
-            # so the next achieved_goal depends also on the previous state and action
-            # because we are in a GoalEnv:
-            # r_t = reward(s_t, a_t) = reward(next_achieved_goal, desired_goal)
-            # therefore we have to use next_obs["achieved_goal"] and not obs["achieved_goal"]
-            next_obs["achieved_goal"] if rekey == 'g' else next_obs["observation"][:, :3],
-            # here we use the new desired goal
-            obs["desired_goal"] if rekey == 'g' else obs["achieved_goal"],
-            infos,
-            # we use the method of the first environment assuming that all environments are identical.
-            indices=[0],
-        )
+            # Compute new reward
+            rewards = self.env.env_method(
+                "compute_reward",
+                # the new state depends on the previous state and action
+                # s_{t+1} = f(s_t, a_t)
+                # so the next achieved_goal depends also on the previous state and action
+                # because we are in a GoalEnv:
+                # r_t = reward(s_t, a_t) = reward(next_achieved_goal, desired_goal)
+                # therefore we have to use next_obs["achieved_goal"] and not obs["achieved_goal"]
+                next_obs["observation"][:, :3],
+                # here we use the new desired goal
+                obs["achieved_goal"],
+                infos,
+                # we use the method of the first environment assuming that all environments are identical.
+                indices=[0],
+            )
         rewards = rewards[0].astype(np.float32)  # env_method returns a list containing one element
         obs = self._normalize_obs(obs, env)
         next_obs = self._normalize_obs(next_obs, env)
